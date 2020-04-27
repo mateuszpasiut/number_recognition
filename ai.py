@@ -1,0 +1,197 @@
+import torch
+import torchvision
+import json
+import logging
+import os
+import time
+import functools
+
+with open('config.json') as json_config:
+    data = json.load(json_config)
+
+general = data['general']
+data_set = data['data_set']
+optimizer = data['optimizer']
+
+EPOCHS = general['epochs']
+SAVE_MODEL = general['save_model']
+SAVE_NAME = general['save_name']
+SET_INFO_PATH = general['set_info_path']
+NUM_WORKERS = data_set['num_workers']
+LOG_INTERVAL = data_set['log_interval']
+TEST_BATCH_SIZE = data_set['test_batch_size']
+TRAIN_BATCH_SIZE = data_set['train_batch_size']
+
+OPTIMIZER_LR = optimizer['optimizer_lr']
+
+
+def timing(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kw):
+        start_time = time.time()
+        result = f(*args, **kw)
+        end_time = time.time()
+        logging.info('Executing function: [%s] took [%2.4f] seconds', f.__name__, end_time - start_time)
+        return result
+
+    return wrapper
+
+
+class Network(torch.nn.Module):
+    """Network class representing neural network model."""
+
+    def __init__(self):
+        super().__init__()
+        # fully connected layers
+        self.first_layer = torch.nn.Linear(784, 256, bias=True)
+        self.second_layer = torch.nn.Linear(256, 128, bias=True)
+        self.third_layer = torch.nn.Linear(128, 64, bias=True)
+        self.fourth_layer = torch.nn.Linear(64, 10, bias=True)
+
+    def forward(self, x):
+        # relu - activation function - relu(x) = max(0,x)
+        x = torch.nn.functional.relu(self.first_layer(x))
+        x = torch.nn.functional.relu(self.second_layer(x))
+        x = torch.nn.functional.relu(self.third_layer(x))
+        x = self.fourth_layer(x)
+
+        # applies softmax method on 1-dimensional input tensor (this case: linear -> dim=1)
+        return torch.nn.functional.log_softmax(x, dim=1)
+
+
+def load_sets(train_batch_size: int, test_batch_size: int) -> (
+torch.utils.data.DataLoader, torch.utils.data.DataLoader):
+    """
+    Loads MNIST dataset from torchvision into both train and test data sets.
+    :param train_batch_size: train set batch size
+    :param test_batch_size: test set batch size
+    :return: loaded (train set, loaded test) set (as tuple)
+    """
+
+    train_set = torchvision.datasets.MNIST('', train=True, download=True,
+                                           transform=torchvision.transforms.Compose(
+                                               [torchvision.transforms.ToTensor()]))
+
+    test_set = torchvision.datasets.MNIST('', train=False, download=True,
+                                          transform=torchvision.transforms.Compose([torchvision.transforms.ToTensor()]))
+
+    train_set_loaded = torch.utils.data.DataLoader(train_set, train_batch_size, shuffle=True, num_workers=NUM_WORKERS,
+                                                   pin_memory=True, timeout=10)
+    test_set_loaded = torch.utils.data.DataLoader(test_set, test_batch_size, shuffle=False, num_workers=NUM_WORKERS,
+                                                  pin_memory=True, timeout=10)
+
+    # sets contain [0] - batch of samples, [1] tensor of numeric values / (tensor of tensors)
+    return train_set_loaded, test_set_loaded
+
+
+@timing
+def train_model(model: Network, train_set_loaded: torch.utils.data.DataLoader, optimizer: torch.optim.Optimizer,
+                epoch: int, device: torch.device) -> None:
+    """
+    Implements training model, logs info with frequency based on LOG_INTERVAL config variable.
+    Logs epoch information.
+    :param model: neural network model
+    :param train_set_loaded: train set
+    :param optimizer: torch optimizer
+    :param epoch: specifies in which epoch function currently is in
+    :device: device on which model is being run
+    """
+
+    sumed_loss = 0
+    correct = 0
+
+    for batch_index, (x, y) in enumerate(train_set_loaded):
+        x, y = x.to(device), y.to(device)
+        model.zero_grad()
+        output = model(x.view(-1, 784))
+        for index, res_ten in enumerate(output):
+            if torch.argmax(res_ten) == y[index]:
+                correct += 1
+        loss = torch.nn.functional.nll_loss(output, y)
+        loss.backward()
+        optimizer.step()
+        sumed_loss += loss.item()
+        if batch_index % LOG_INTERVAL == 0:
+            logging.info('[TRAIN_SET] Epoch: [%d] [%d/%d] Loss: [%f]', epoch, batch_index * len(x),
+                         len(train_set_loaded.dataset), loss.item())
+
+    logging.debug('[TRAIN_SET] Average loss during [%s] epoch: [%s]', epoch, sumed_loss / (60000 / TRAIN_BATCH_SIZE))
+    logging.info('[TRAIN_SET] Correct: [%s/%s] / Accuracy: ][%s]%%', correct, len(train_set_loaded.dataset),
+                 round(correct / len(train_set_loaded.dataset), 3) * 100)
+
+
+def test_model(model: Network, test_set_loaded: torch.utils.data.DataLoader, device: torch.device) -> None:
+    """
+    Implements testing model accuracy, compares results generated by trained model. Logs accuracy.
+    :param model: neural network model
+    :param test_set_loaded: test set
+    :param device: device on which model is being run
+    """
+
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for (x, y) in test_set_loaded:
+            x, y = x.to(device), y.to(device)
+            output = model(x.view(-1, 784))
+            for index, res_ten in enumerate(output):
+                if torch.argmax(res_ten) == y[index]:
+                    correct += 1
+                total += 1
+
+        logging.info('[TEST_SET] Correct: [%s/%s] / Accuracy: [%s]%%', correct, total, round(correct / total, 3) * 100)
+
+
+def MNIST_set_info(set_loaded: torch.utils.data.DataLoader) -> None:
+    """
+    Prints the information about data set based on SET_INFO_PATH file in config.json, or if
+    it does not exist, creates such and fill it in with information.
+    :param set_loaded: loaded set of data
+    """
+
+    if not os.path.exists(SET_INFO_PATH):
+        total = 0
+        counter_dict = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0}
+
+        logging.info('[%s] not found, starting to create file', SET_INFO_PATH)
+        for (_, y) in set_loaded:
+            for ys in y:
+                counter_dict[int(ys)] += 1
+                total += 1
+
+        with open(SET_INFO_PATH, 'w') as file:
+            for i in counter_dict:
+                file.write('{}: {}\n'.format(i, round(counter_dict[i] / total * 100, 3)))
+        logging.info('[%s] created', SET_INFO_PATH)
+    else:
+        logging.info('[%s] found, reading file', SET_INFO_PATH)
+        with open(SET_INFO_PATH) as file:
+            f_read = file.read()
+        logging.info('\n%s', f_read)
+
+
+def main():
+    """Implements main program logic."""
+
+    logging.basicConfig(filename='mnist.log', format='%(asctime)s:%(levelname)s:%(message)s', level=logging.DEBUG)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = Network().to(device)
+
+    # Adaptive momentum
+    optimizer = torch.optim.Adam(model.parameters(), lr=OPTIMIZER_LR)
+
+    train_set_loaded, test_set_loaded = load_sets(TRAIN_BATCH_SIZE, TEST_BATCH_SIZE)
+    MNIST_set_info(train_set_loaded)
+
+    for epoch in range(1, EPOCHS + 1):
+        train_model(model, train_set_loaded, optimizer, epoch, device)
+        test_model(model, test_set_loaded, device)
+
+    if SAVE_MODEL:
+        torch.save(model.state_dict(), SAVE_NAME)
+
+
+if __name__ == '__main__':
+    main()
